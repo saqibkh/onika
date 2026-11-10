@@ -1,0 +1,94 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# onika with HIP for gfx90a and runs the test suite on a simulated AMD
+# Instinct MI250X (https://github.com/pantheongpu/pantheonsim). A simulator
+# cannot reproduce hardware-specific behavior or timing, so it complements
+# real-GPU testing and does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "src/**"
+      - "include/**"
+      - "tests/**"
+      - "plugins/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ctest:
+    name: HIP build and tests (ROCm 7.1 and simulated MI250X)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and ROCm
+        uses: pantheongpu/setup-pantheonsim@ca87fe3143b29166822b923d6050945c5179408c # v0.1.5
+        with:
+          gpu: amd/mi250x
+          cuda-toolkit: none
+          rocm: "7.1"
+
+      # The action installs the HIP compiler side only. onika also needs
+      # rocm-cmake (find_package(ROCM)) and libroctx64 (roctracer-dev).
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libyaml-cpp-dev libopenmpi-dev openmpi-bin rocm-cmake roctracer-dev
+          ls /opt/rocm*/lib/libroctx64* /opt/rocm*/share/rocm/cmake 2>&1 | head -20 || true
+
+      # Same options as cmake_hip.yml. CMAKE_CXX_FLAGS_RELEASE drops -DNDEBUG
+      # (the host-code tests use assert); the HIP flags keep the Release default.
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS_RELEASE=-O2 \
+            -DONIKA_BUILD_CUDA=ON \
+            -DONIKA_ENABLE_HIP=ON \
+            -DCMAKE_HIP_ARCHITECTURES=gfx90a \
+            -DONIKA_HAS_GPU_ATOMIC_MIN_MAX_DOUBLE=ON
+
+      - name: Build
+        run: cmake --build build -j3
+
+      # Same selection as cmake_gcc.yml: skip omp_tasks 5 to 11 and the tests
+      # that need 4 or more MPI ranks.
+      # The adhoc tests start 3 MPI ranks: allow OpenMPI to oversubscribe the
+      # runner's slots.
+      - name: Test
+        env:
+          OMPI_MCA_rmaps_base_oversubscribe: "1"
+        run: |
+          vgpu run ctest --test-dir build --output-on-failure --no-tests=error \
+            -E "onika_test_omp_tasks_(5|6|7|8|9|10|11)$|(np[4-9](_|$)|np[0-9]{2,}(_|$))"
+
+      # These GPU test programs are built but not registered with ctest, so
+      # run them directly on the simulated GPU.
+      - name: GPU test programs
+        working-directory: build
+        env:
+          OMPI_MCA_rmaps_base_oversubscribe: "1"
+        run: |
+          for mode in hybrid-sequence hybrid-lane hybrid-delayed-lane singletask-dependency; do
+            echo "::group::parallel_queue_lane $mode"
+            vgpu run ./parallel_queue_lane $mode task 1d
+            vgpu run ./parallel_queue_lane $mode pfor 2d
+            echo "::endgroup::"
+          done
+          echo "0 0 1037" | vgpu run ./gpu_reduce_min_fp64
